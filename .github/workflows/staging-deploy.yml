@@ -1,0 +1,25 @@
+name: Deploy to Staging (Nitro Server)
+
+on:
+  push:
+    branches:
+      - staging
+
+jobs:
+  deploy:
+    name: SSH Deploy to Nitro Server
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.NITRO_HOST }}
+          username: ${{ secrets.NITRO_USER }}
+          key: ${{ secrets.NITRO_SSH_KEY }}
+          script: |
+            cd ~/orion-backend
+            ./deploy.sh
