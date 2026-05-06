@@ -1,11 +1,13 @@
 import { Response } from 'express';
 import { AuthRequest } from '../types/auth.types.js';
-import { groqService } from '../services/index.js';
+import { groqService, summarizationService } from '../services/index.js';
 import { messageRepository } from '../repositories/index.js';
 import { logger } from '../utils/logger.js';
 import rateLimit from 'express-rate-limit';
 
 const CTX = 'ChatController';
+
+const SYSTEM_PROMPT = `You are ORION (Operational Reasoning Intelligence Orchestration Node), Nielless Acharya's personal AI. You are direct, logical, and practical — a systems thinker. No hype, no fluff. Challenge bad assumptions, surface logical flaws. Keep responses concise unless detail is specifically requested.`;
 
 export const chatRateLimiter = rateLimit({
   windowMs: 60 * 1000, // 1 minute
@@ -20,7 +22,7 @@ type MessageType = (typeof VALID_MESSAGE_TYPES)[number];
 
 export const chatController = {
   async send(req: AuthRequest, res: Response): Promise<void> {
-    const { text, type: rawType = 'text' } = req.body;
+    const { text, type: rawType = 'text', stream = true } = req.body;
     const userId = req.user!.userId;
 
     if (!text || typeof text !== 'string' || text.trim().length === 0) {
@@ -29,54 +31,90 @@ export const chatController = {
       return;
     }
 
-    if (text.length > 4000) {
-      logger.warn(CTX, 'Send failed — text too long', { userId, length: text.length });
-      res.status(400).json({ error: 'text exceeds maximum length of 4000 characters' });
-      return;
-    }
-
     const type: MessageType = VALID_MESSAGE_TYPES.includes(rawType) ? rawType : 'text';
-    logger.info(CTX, 'Chat message received', { userId, type, textLength: text.trim().length });
+    logger.info(CTX, 'Chat message received', { userId, type, textLength: text.trim().length, stream });
 
     const start = Date.now();
 
     // Save user message
     await messageRepository.create(userId, 'user', text.trim(), type);
-    logger.debug(CTX, 'User message persisted', { userId });
 
-    // Fetch last 10 messages for context
-    const history = await messageRepository.findRecent(userId, 10);
-    logger.debug(CTX, 'Chat history fetched', { userId, historyCount: history.length });
+    // Fetch context summary (Tier 2) and last 20 messages (Tier 1)
+    const contextPrefix = await summarizationService.getContextPrefix(userId);
+    const systemPromptOverride = contextPrefix ? `${contextPrefix}${SYSTEM_PROMPT}` : SYSTEM_PROMPT;
 
-    // Call Groq — exclude the message we just saved (last item)
-    const { content, tokensUsed, model } = await groqService.chat(
-      history.slice(0, -1).map((m: any) => ({ role: m.role, content: m.content })),
-      text.trim()
-    );
+    const history = await messageRepository.findRecent(userId, 20);
+    // Exclude the message we just saved for the history sent to LLM
+    const llmHistory = history.slice(0, -1).map((m: any) => ({ role: m.role, content: m.content }));
 
-    const processingTimeMs = Date.now() - start;
-    logger.info(CTX, 'Groq response received', { userId, model, tokensUsed, processingTimeMs });
+    if (!stream) {
+      // Fallback to non-streaming if explicitly requested
+      const { content, tokensUsed, model } = await groqService.chat(llmHistory, text.trim(), systemPromptOverride);
+      const processingTimeMs = Date.now() - start;
+      const assistantMessage = await messageRepository.create(userId, 'assistant', content, 'text', tokensUsed, processingTimeMs);
+      
+      // Trigger async summarization check
+      summarizationService.checkAndSummarize(userId).catch(e => logger.error(CTX, 'Async summarization trigger failed', { error: e.message }));
 
-    // Save assistant response
-    const assistantMessage = await messageRepository.create(
-      userId,
-      'assistant',
-      content,
-      'text',
-      tokensUsed,
-      processingTimeMs
-    );
-    logger.debug(CTX, 'Assistant message persisted', { userId, messageId: assistantMessage.id });
+      res.json({
+        message: { id: assistantMessage.id, role: 'assistant', content: assistantMessage.content, createdAt: assistantMessage.created_at },
+        metadata: { tokensUsed, processingTime: processingTimeMs, model },
+      });
+      return;
+    }
 
-    res.json({
-      message: {
-        id: assistantMessage.id,
-        role: 'assistant',
-        content: assistantMessage.content,
+    // SSE Setup
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+
+    let fullContent = '';
+    let metadata: any = null;
+
+    try {
+      const tokenStream = groqService.streamChat(llmHistory, text.trim(), systemPromptOverride);
+
+      for await (const chunk of tokenStream) {
+        if (chunk.type === 'token') {
+          fullContent += chunk.content;
+          logger.debug(CTX, 'Writing token to stream', { userId, token: chunk.content });
+          res.write(`data: ${JSON.stringify({ token: chunk.content })}\n\n`);
+        } else if (chunk.type === 'metadata') {
+          metadata = chunk;
+        }
+      }
+
+      const processingTimeMs = Date.now() - start;
+      // Persist assistant message
+      const assistantMessage = await messageRepository.create(
+        userId,
+        'assistant',
+        fullContent,
+        'text',
+        metadata?.tokensUsed,
+        processingTimeMs
+      );
+
+      // Trigger async summarization check
+      summarizationService.checkAndSummarize(userId).catch(e => logger.error(CTX, 'Async summarization trigger failed', { error: e.message }));
+
+      // Final event with full message info and metadata
+      res.write(`data: ${JSON.stringify({
+        done: true,
+        messageId: assistantMessage.id,
         createdAt: assistantMessage.created_at,
-      },
-      metadata: { tokensUsed, processingTime: processingTimeMs, model },
-    });
+        metadata: {
+          tokensUsed: metadata?.tokensUsed,
+          processingTime: processingTimeMs,
+          model: metadata?.model || 'primary'
+        }
+      })}\n\n`);
+      res.end();
+    } catch (err: any) {
+      logger.error(CTX, 'Streaming failed', { userId, error: err.message });
+      res.write(`data: ${JSON.stringify({ error: 'Streaming failed' })}\n\n`);
+      res.end();
+    }
   },
 
   async getHistory(req: AuthRequest, res: Response): Promise<void> {
@@ -127,5 +165,47 @@ export const chatController = {
     const deleted = results.filter(Boolean).length;
     logger.info(CTX, 'Messages deleted', { userId, requested: messageIds.length, deleted });
     res.json({ deleted, message: `Successfully deleted ${deleted} message(s)` });
+  },
+
+  async search(req: AuthRequest, res: Response): Promise<void> {
+    const userId = req.user!.userId;
+    const query = req.query.q as string;
+
+    if (!query || query.trim().length === 0) {
+      res.status(400).json({ error: 'Query parameter "q" is required' });
+      return;
+    }
+
+    logger.info(CTX, 'Search requested', { userId, query });
+    const messages = await messageRepository.search(userId, query.trim());
+    res.json({ messages });
+  },
+
+  async transcribe(req: AuthRequest, res: Response): Promise<void> {
+    const userId = req.user!.userId;
+    const file = req.file;
+
+    if (!file) {
+      logger.warn(CTX, 'Transcription failed — no file uploaded', { userId });
+      res.status(400).json({ error: 'No audio file provided' });
+      return;
+    }
+
+    logger.info(CTX, 'Audio file received for transcription', { 
+      userId, 
+      filename: file.originalname, 
+      size: file.size,
+      mimetype: file.mimetype 
+    });
+
+    try {
+      logger.debug(CTX, 'Calling Groq transcription service...', { userId });
+      const text = await groqService.transcribe(file.buffer, file.originalname);
+      logger.info(CTX, 'Transcription completed successfully', { userId, textLength: text.length });
+      res.json({ text });
+    } catch (err: any) {
+      logger.error(CTX, 'Transcription error', { userId, error: err.message, stack: err.stack });
+      res.status(500).json({ error: `Failed to transcribe audio: ${err.message}` });
+    }
   },
 };

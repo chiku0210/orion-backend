@@ -63,4 +63,66 @@ export const messageRepository = {
     );
     return rows[0] ?? null;
   },
+
+  async getLatestSummary(userId: number) {
+    const { rows } = await pool.query(
+      `SELECT * FROM conversation_summaries
+       WHERE user_id = $1
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [userId]
+    );
+    return rows[0] ?? null;
+  },
+
+  async createSummary(userId: number, text: string, startId: number, endId: number, tokensUsed: number) {
+    const { rows } = await pool.query(
+      `INSERT INTO conversation_summaries (user_id, summary_text, start_message_id, end_message_id, tokens_used)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING *`,
+      [userId, text, startId, endId, tokensUsed]
+    );
+    return rows[0];
+  },
+
+  async getUnsummarizedTokens(userId: number) {
+    const { rows } = await pool.query(
+      `SELECT COALESCE(SUM(tokens_used), 0) as total
+       FROM messages
+       WHERE user_id = $1 AND is_summarized = FALSE`,
+      [userId]
+    );
+    return parseInt(rows[0].total);
+  },
+
+  async markAsSummarized(userId: number, endId: number) {
+    await pool.query(
+      `UPDATE messages
+       SET is_summarized = TRUE
+       WHERE user_id = $1 AND id <= $2 AND is_summarized = FALSE`,
+      [userId, endId]
+    );
+  },
+
+  async findOldestUnsummarized(userId: number, limit: number = 50) {
+    const { rows } = await pool.query(
+      `SELECT * FROM messages
+       WHERE user_id = $1 AND is_summarized = FALSE
+       ORDER BY created_at ASC
+       LIMIT $2`,
+      [userId, limit]
+    );
+    return rows;
+  },
+
+  async search(userId: number, query: string, limit: number = 50) {
+    const { rows } = await pool.query(
+      `SELECT * FROM messages
+       WHERE user_id = $1 AND content ILIKE $2
+       ORDER BY created_at DESC
+       LIMIT $3`,
+      [userId, `%${query}%`, limit]
+    );
+    return rows;
+  },
 };
