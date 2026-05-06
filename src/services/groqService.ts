@@ -24,9 +24,9 @@ export interface GroqResponse {
 }
 
 export const groqService = {
-  async chat(history: Message[], userMessage: string): Promise<GroqResponse> {
+  async chat(history: Message[], userMessage: string, systemPromptOverride?: string): Promise<GroqResponse> {
     const messages = [
-      { role: 'system' as const, content: SYSTEM_PROMPT },
+      { role: 'system' as const, content: systemPromptOverride || SYSTEM_PROMPT },
       ...history.map((m) => ({ role: m.role, content: m.content })),
       { role: 'user' as const, content: userMessage },
     ];
@@ -70,5 +70,64 @@ export const groqService = {
     }
 
     throw new Error('Groq service failed after max retries');
+  },
+
+  async transcribe(fileBuffer: Buffer, filename: string): Promise<string> {
+    logger.debug(CTX, 'Starting Groq transcription request', { filename, bufferSize: fileBuffer.length });
+
+    try {
+      const response = await groq.audio.transcriptions.create({
+        file: await Groq.toFile(fileBuffer, filename, { type: 'audio/wav' }),
+        model: 'whisper-large-v3-turbo',
+        response_format: 'json',
+        language: 'en',
+        temperature: 0.0,
+      });
+
+      logger.info(CTX, 'Groq transcription successful', { filename });
+      return response.text;
+    } catch (err: any) {
+      logger.error(CTX, 'Groq transcription failed', { error: err.message, filename });
+      throw err;
+    }
+  },
+
+  async *streamChat(history: Message[], userMessage: string, systemPromptOverride?: string): AsyncGenerator<any> {
+    const messages = [
+      { role: 'system' as const, content: systemPromptOverride || SYSTEM_PROMPT },
+      ...history.map((m) => ({ role: m.role, content: m.content })),
+      { role: 'user' as const, content: userMessage },
+    ];
+
+    logger.debug(CTX, 'Starting streaming Groq chat request', { historyLength: history.length });
+
+    try {
+      const stream = await groq.chat.completions.create({
+        model: PRIMARY_MODEL,
+        messages,
+        temperature: 0.7,
+        max_tokens: 2048,
+        stream: true,
+      });
+
+      for await (const chunk of stream) {
+        const content = chunk.choices[0]?.delta?.content || '';
+        if (content) {
+          yield { type: 'token', content };
+        }
+
+        // Groq sometimes provides usage info in the last chunk
+        if (chunk.x_groq?.usage) {
+          yield {
+            type: 'metadata',
+            tokensUsed: chunk.x_groq.usage.total_tokens,
+            model: PRIMARY_MODEL,
+          };
+        }
+      }
+    } catch (err: any) {
+      logger.error(CTX, 'Streaming Groq call failed', { error: err.message });
+      throw err;
+    }
   },
 };
